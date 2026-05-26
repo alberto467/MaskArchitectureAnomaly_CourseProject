@@ -34,7 +34,133 @@ from torch.nn.functional import interpolate
 from torchvision.transforms.v2.functional import pad
 import logging
 
+from helpers.class_remap import coco_city_class_head_remap
 from training.two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
+
+
+def _grid_factors(num_tokens):
+    if num_tokens <= 0:
+        return []
+    factors = []
+    for h in range(1, int(math.sqrt(num_tokens)) + 1):
+        if num_tokens % h == 0:
+            w = num_tokens // h
+            factors.append((h, w))
+            if h != w:
+                factors.append((w, h))
+    return factors
+
+
+def _choose_grid(num_tokens, target_ratio: Optional[float] = None):
+    """Choose a grid (h, w) whose area matches num_tokens and best fits target_ratio."""
+    factors = _grid_factors(num_tokens)
+    if not factors:
+        side = int(math.sqrt(num_tokens))
+        return side, side
+    if target_ratio is None:
+        return min(factors, key=lambda hw: abs(math.log(hw[0] / hw[1])))
+    return min(factors, key=lambda hw: abs((hw[0] / hw[1]) - target_ratio))
+
+
+def interpolate_pos_embed(
+    pos_embed_ckpt,
+    pos_embed_current,
+    grid_size_current: tuple[int, int],
+    num_prefix_tokens_current: Optional[int] = None,
+):
+    """
+    Interpolate positional embeddings from checkpoint to current model size using 2D bicubic interpolation.
+    """
+    if pos_embed_ckpt.shape == pos_embed_current.shape:
+        return pos_embed_ckpt
+
+    num_tokens_ckpt = pos_embed_ckpt.shape[1]
+    num_tokens_current = pos_embed_current.shape[1]
+    embed_dim = pos_embed_ckpt.shape[2]
+
+    h_current, w_current = grid_size_current
+    num_spatial_current = h_current * w_current
+    if num_spatial_current <= 0:
+        raise ValueError("grid_size_current must be positive")
+
+    if num_prefix_tokens_current is None:
+        num_prefix_tokens_current = num_tokens_current - num_spatial_current
+    if num_prefix_tokens_current < 0:
+        num_prefix_tokens_current = 0
+        num_spatial_current = num_tokens_current
+        h_current, w_current = _choose_grid(num_spatial_current)
+
+    target_ratio = h_current / w_current
+
+    # Pick checkpoint prefix that yields the most square-like valid grid.
+    # Checkpoints are usually pre-trained on square images.
+    prefix_candidates = [num_prefix_tokens_current, 0, 1, 5, 4, 2]
+    seen = set()
+    prefix_candidates = [p for p in prefix_candidates if not (p in seen or seen.add(p))]
+
+    best = None
+    for prefix_candidate in prefix_candidates:
+        num_spatial_test = num_tokens_ckpt - prefix_candidate
+        if num_spatial_test <= 0:
+            continue
+        h_test, w_test = _choose_grid(num_spatial_test, target_ratio=1.0)
+        if h_test * w_test != num_spatial_test:
+            continue
+        ratio_diff = abs((h_test / w_test) - 1.0)
+        pref_bias = 0 if prefix_candidate == num_prefix_tokens_current else 1
+        score = (ratio_diff, pref_bias)
+        if best is None or score < best[0]:
+            best = (score, prefix_candidate, h_test, w_test)
+
+    if best is None:
+        num_prefix_tokens_ckpt = num_prefix_tokens_current
+        num_spatial_ckpt = max(0, num_tokens_ckpt - num_prefix_tokens_ckpt)
+        h_ckpt, w_ckpt = _choose_grid(num_spatial_ckpt, target_ratio=1.0)
+        logging.warning("Falling back to inferred checkpoint grid size.")
+    else:
+        _, num_prefix_tokens_ckpt, h_ckpt, w_ckpt = best
+        num_spatial_ckpt = num_tokens_ckpt - num_prefix_tokens_ckpt
+        if num_prefix_tokens_ckpt != num_prefix_tokens_current:
+            logging.info(
+                f"Detected checkpoint prefix tokens: {num_prefix_tokens_ckpt}"
+            )
+
+    # Extract prefix and spatial tokens from checkpoint
+    prefix_ckpt = pos_embed_ckpt[:, :num_prefix_tokens_ckpt, :]
+    spatial_ckpt = pos_embed_ckpt[:, num_prefix_tokens_ckpt:, :]
+
+    # Get target prefix and spatial sizes
+    prefix_current = pos_embed_current[:, :num_prefix_tokens_current, :]
+
+    logging.info(
+        "Interpolating pos_embed from "
+        f"{h_ckpt}×{w_ckpt} ({num_spatial_ckpt} tokens) "
+        f"to {h_current}×{w_current} ({num_spatial_current} tokens)"
+    )
+    
+    # Reshape spatial tokens to 2D grid: [1, num_spatial, embed_dim] -> [1, embed_dim, h, w]
+    spatial_ckpt_grid = spatial_ckpt.reshape(1, h_ckpt, w_ckpt, embed_dim).permute(0, 3, 1, 2)
+    
+    # Use bicubic interpolation to resize
+    spatial_current_grid = torch.nn.functional.interpolate(
+        spatial_ckpt_grid.float(),
+        size=(h_current, w_current),
+        mode='bicubic',
+        align_corners=False
+    )
+    
+    # Reshape back to 1D sequence: [1, embed_dim, h, w] -> [1, num_spatial, embed_dim]
+    spatial_current = spatial_current_grid.permute(0, 2, 3, 1).reshape(1, h_current * w_current, embed_dim)
+    
+    # Combine prefix tokens (CLS, registers) with interpolated spatial tokens
+    # Prefer checkpoint prefix tokens when sizes match; otherwise keep current prefix.
+    if num_prefix_tokens_ckpt == num_prefix_tokens_current:
+        prefix_to_use = prefix_ckpt
+    else:
+        prefix_to_use = prefix_current
+    pos_embed_interp = torch.cat([prefix_to_use, spatial_current], dim=1)
+    
+    return pos_embed_interp
 
 bold_green = "\033[1;32m"
 reset = "\033[0m"
@@ -59,6 +185,15 @@ class LightningModule(lightning.LightningModule):
         ckpt_path=None,
         delta_weights=False,
         load_ckpt_class_head=True,
+        remap_ckpt_class_head=False,
+        # Staged training: freeze encoder for N epochs then unfreeze
+        freeze_encoder_epochs: int = 0,
+        freeze_encoder_initial: bool = False,
+        # Finer staged freezing controls (applied only during the initial freeze period)
+        freeze_encoder_blocks_until: int = 0,
+        freeze_encoder_patch_embed: bool = False,
+        freeze_encoder_pos_embed: bool = False,
+        freeze_class_head_initial: bool = False,
     ):
         super().__init__()
 
@@ -78,6 +213,49 @@ class LightningModule(lightning.LightningModule):
 
         self.strict_loading = False
 
+        # Staged training attributes
+        self.freeze_encoder_epochs = freeze_encoder_epochs
+        self.freeze_encoder_initial = freeze_encoder_initial
+        self.freeze_encoder_blocks_until = freeze_encoder_blocks_until
+        self.freeze_encoder_patch_embed = freeze_encoder_patch_embed
+        self.freeze_encoder_pos_embed = freeze_encoder_pos_embed
+        self.freeze_class_head_initial = freeze_class_head_initial
+        self._frozen_param_names: set[str] = set()
+        self._had_initial_freeze = False
+
+        # If requested, freeze selected parameters immediately so optimizer is built with correct requires_grad
+        if self.freeze_encoder_epochs > 0:
+            for n, p in self.named_parameters():
+                freeze_now = False                
+
+                # Fine-grained backbone controls.
+                if self.freeze_encoder_blocks_until > 0 and n.startswith(
+                    "network.encoder.backbone.blocks."
+                ):
+                    block_str = n.split(".")[4]
+                    if block_str.isdigit() and int(block_str) < self.freeze_encoder_blocks_until:
+                        freeze_now = True
+
+                elif self.freeze_encoder_patch_embed and n.startswith(
+                    "network.encoder.backbone.patch_embed"
+                ):
+                    freeze_now = True
+
+                elif self.freeze_encoder_pos_embed and n.startswith(
+                    "network.encoder.backbone.pos_embed"
+                ):
+                    freeze_now = True
+                
+                elif self.freeze_encoder_initial and n.startswith("network.encoder."):
+                    freeze_now = True
+
+                if freeze_now:
+                    p.requires_grad = False
+                    self._frozen_param_names.add(n)
+
+            self._had_initial_freeze = len(self._frozen_param_names) > 0
+
+
         if delta_weights and ckpt_path:
             logging.info("Delta weights mode")
             self._zero_init_outside_encoder(skip_class_head=not load_ckpt_class_head)
@@ -94,8 +272,12 @@ class LightningModule(lightning.LightningModule):
             self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head)
         elif ckpt_path:
             ckpt = self._load_ckpt(ckpt_path, load_ckpt_class_head)
+            if load_ckpt_class_head and remap_ckpt_class_head:
+                logging.info("Remapping class head in checkpoint")
+                coco_city_class_head_remap(ckpt)
             incompatible_keys = self.load_state_dict(ckpt, strict=False)
             self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head)
+
 
         self.log = torch.compiler.disable(self.log)  # type: ignore
 
@@ -167,6 +349,30 @@ class LightningModule(lightning.LightningModule):
                 "frequency": 1,
             },
         }
+
+    def on_train_epoch_start(self) -> None:
+        """Unfreeze encoder after configured number of epochs.
+
+        This runs at the start of each training epoch. If the encoder was initially
+        frozen and the current epoch equals the configured freeze period, re-enable
+        gradients for encoder parameters and optionally adjust optimizer LRs.
+        """
+        # Only act if we initially froze something.
+        if not getattr(self, "_had_initial_freeze", False):
+            return
+
+        # Trainer's current_epoch is 0-based; unfreeze when current_epoch == freeze_encoder_epochs
+        cur_epoch = int(self.current_epoch) if hasattr(self, "current_epoch") else 0
+        if cur_epoch < self.freeze_encoder_epochs:
+            return
+
+        # Unfreeze only the parameters that were frozen initially.
+        for n, p in self.named_parameters():
+            if n in self._frozen_param_names:
+                p.requires_grad = True
+
+        # Ensure we only unfreeze once
+        self._had_initial_freeze = False
 
     def forward(self, imgs):
         x = imgs / 255.0
@@ -403,12 +609,16 @@ class LightningModule(lightning.LightningModule):
                     self.log(
                         f"metrics/{log_prefix}_iou_class_{class_idx}{block_postfix}",
                         iou,
+                        on_epoch=True,
+                        on_step=False,
                     )
 
             iou_all = float(iou_per_class.mean())
             self.log(
                 f"metrics/{log_prefix}_iou_all{block_postfix}",
                 iou_all,
+                on_epoch=True,
+                on_step=False
             )
 
     def _on_eval_epoch_end_instance(self, log_prefix):
@@ -610,6 +820,8 @@ class LightningModule(lightning.LightningModule):
     def window_imgs_semantic(self, imgs):
         crops, origins = [], []
 
+        crop_h, crop_w = self.img_size
+
         for i in range(len(imgs)):
             img = imgs[i]
             new_h, new_w = self.scale_img_size_semantic(img.shape[-2:])
@@ -619,17 +831,25 @@ class LightningModule(lightning.LightningModule):
                 torch.from_numpy(np.array(resized_img)).permute(2, 0, 1).to(img.device)
             )
 
-            num_crops = math.ceil(max(resized_img.shape[-2:]) / min(self.img_size))
-            overlap = num_crops * min(self.img_size) - max(resized_img.shape[-2:])
+            # Slide a fixed crop window matching the model's expected input size.
+            if resized_img.shape[-2] >= resized_img.shape[-1]:
+                crop_dim = crop_h
+                max_dim = resized_img.shape[-2]
+            else:
+                crop_dim = crop_w
+                max_dim = resized_img.shape[-1]
+
+            num_crops = math.ceil(max_dim / crop_dim)
+            overlap = num_crops * crop_dim - max_dim
             overlap_per_crop = (overlap / (num_crops - 1)) if overlap > 0 else 0
 
             for j in range(num_crops):
-                start = int(j * (min(self.img_size) - overlap_per_crop))
-                end = start + min(self.img_size)
+                start = int(j * (crop_dim - overlap_per_crop))
+                end = start + crop_dim
                 if resized_img.shape[-2] > resized_img.shape[-1]:
-                    crop = resized_img[:, start:end, :]
+                    crop = resized_img[:, start:end, :crop_w]
                 else:
-                    crop = resized_img[:, :, start:end]
+                    crop = resized_img[:, :crop_h, start:end]
 
                 crops.append(crop)
                 origins.append((i, start, end))
@@ -879,7 +1099,7 @@ class LightningModule(lightning.LightningModule):
         return summed
 
     def _load_ckpt(self, ckpt_path, load_ckpt_class_head):
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         if "state_dict" in ckpt:
             ckpt = ckpt["state_dict"]
         ckpt = {k: v for k, v in ckpt.items() if "criterion.empty_weight" not in k}
@@ -889,6 +1109,33 @@ class LightningModule(lightning.LightningModule):
                 for k, v in ckpt.items()
                 if "class_head" not in k and "class_predictor" not in k
             }
+        
+        # Interpolate positional embeddings if their shape doesn't match the current model
+        current_state_dict = self.state_dict()
+        grid_size = self.network.encoder.backbone.patch_embed.grid_size
+        
+        for key in list(ckpt.keys()):
+            if "pos_embed" in key and key in current_state_dict:
+                if ckpt[key].shape != current_state_dict[key].shape:
+                    # Derive num_prefix_tokens from actual pos_embed length minus
+                    # the spatial grid area — more reliable than backbone.num_prefix_tokens,
+                    # which can disagree with the stored tensor when the image size changes.
+                    num_spatial_current = grid_size[0] * grid_size[1]
+                    num_prefix_tokens = max(
+                        0, current_state_dict[key].shape[1] - num_spatial_current
+                    )
+                    logging.info(
+                        f"Interpolating {key}: {ckpt[key].shape} -> "
+                        f"{current_state_dict[key].shape} "
+                        f"(grid={grid_size}, prefix_tokens={num_prefix_tokens})"
+                    )
+                    ckpt[key] = interpolate_pos_embed(
+                        ckpt[key],
+                        current_state_dict[key],
+                        grid_size_current=grid_size,
+                        num_prefix_tokens_current=num_prefix_tokens,
+                    )
+        
         logging.info(f"Loaded {len(ckpt)} keys")
         return ckpt
 

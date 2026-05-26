@@ -168,10 +168,7 @@ def cli_main():
         trainer_defaults={
             "precision": "16-mixed",
             "enable_model_summary": False,
-            "callbacks": [
-                ModelSummary(max_depth=3),
-                LearningRateMonitor(logging_interval="epoch"),
-            ],
+            "callbacks": [ModelSummary(max_depth=3), LearningRateMonitor(logging_interval="epoch")],
             "devices": 1,
             "gradient_clip_val": 0.01,
             "gradient_clip_algorithm": "norm",

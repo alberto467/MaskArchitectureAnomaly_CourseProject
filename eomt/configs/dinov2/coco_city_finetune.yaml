@@ -1,0 +1,80 @@
+trainer:
+  max_epochs: 24
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      name: "Coco Model Finetune on Cityscapes Semantic"
+      offline: False
+      project: "coco_model_cityscape_finetune"
+      save_dir: "/content/work/step5/wandb_logs"
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: "metrics/val_iou_all"
+        mode: "max"
+        filename: "best-{epoch:02d}-{metrics/val_iou_all:.4f}"
+        dirpath: "/content/drive/MyDrive/POLITO/FAI/project/downloads/checkpoints"
+        save_top_k: 3
+        save_last: True
+  accumulate_grad_batches: 2
+  # Run validation periodically within each epoch (fraction of training epoch)
+  val_check_interval: 0.5
+  limit_val_batches: 1.0
+  # Gradient clipping to stabilize training with large images/FP16
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: "norm"
+  devices: 1
+  precision: "16-mixed"
+  default_root_dir: "/content/work/step5_runs/coco_to_cityscapes_semantic_ft"
+  enable_checkpointing: True
+model:
+  class_path: training.mask_classification_semantic.MaskClassificationSemantic
+  init_args:
+    attn_mask_annealing_enabled: False
+    attn_mask_annealing_start_steps: [150, 600, 1200]
+    attn_mask_annealing_end_steps: [450, 1000, 1700]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 200
+        num_blocks: 3
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_base_patch14_reg4_dinov2
+    mask_coefficient: 3.5
+    dice_coefficient: 5.0
+    class_coefficient: 3.0
+    lr: 1e-4
+    # llrd: 0.85
+    # llrd_l2_enabled: True
+    # lr_mult: 0.1
+    # Polynomial decay power for the learning rate schedule
+    # poly_power: 1.0
+    # Warmup steps: short linear warmup then longer second warmup stage
+    # warmup_steps: [25, 1000]
+    weight_decay: 0.05
+    # Staged training: freeze encoder initially for N epochs, then unfreeze
+    freeze_encoder_epochs: 2
+    freeze_encoder_initial: True
+    # Fine-grained freeze controls during the initial freeze window
+    # Freeze first N backbone transformer blocks (0 disables block-level freezing)
+    freeze_encoder_blocks_until: 0
+    # Freeze patch embedding layer during initial freeze window
+    freeze_encoder_patch_embed: True
+    # Freeze positional embedding during initial freeze window
+    freeze_encoder_pos_embed: True
+    log_iou_per_class: True
+
+data:
+  class_path: datasets.cityscapes_semantic.CityscapesSemantic
+  init_args:
+    num_workers: 4
+    # reduce per-GPU batch size for high-resolution Cityscapes; effective batch size
+    # will be batch_size * accumulate_grad_batches
+    batch_size: 8
+    # Image / augmentation settings tuned for Cityscapes
+    img_size: [640, 640]
+    # color_jitter_enabled: False
+    scale_range: [0.5, 2.0]
+    # check_empty_targets: True

@@ -41,6 +41,14 @@ class MaskClassificationSemantic(LightningModule):
         ckpt_path: Optional[str] = None,
         delta_weights: bool = False,
         load_ckpt_class_head: bool = True,
+        remap_ckpt_class_head: bool = False,
+        freeze_encoder_epochs: int = 0,
+        freeze_encoder_initial: bool = False,
+        freeze_encoder_blocks_until: int = 0,
+        freeze_encoder_patch_embed: bool = False,
+        freeze_encoder_pos_embed: bool = False,
+        freeze_class_head_initial: bool = False,
+        log_iou_per_class: bool = False,
     ):
         super().__init__(
             network=network,
@@ -59,6 +67,13 @@ class MaskClassificationSemantic(LightningModule):
             ckpt_path=ckpt_path,
             delta_weights=delta_weights,
             load_ckpt_class_head=load_ckpt_class_head,
+            remap_ckpt_class_head=remap_ckpt_class_head,
+            freeze_encoder_epochs=freeze_encoder_epochs,
+            freeze_encoder_initial=freeze_encoder_initial,
+            freeze_encoder_blocks_until=freeze_encoder_blocks_until,
+            freeze_encoder_patch_embed=freeze_encoder_patch_embed,
+            freeze_encoder_pos_embed=freeze_encoder_pos_embed,
+            freeze_class_head_initial=freeze_class_head_initial,
         )
 
         self.save_hyperparameters(ignore=["_class_path"])
@@ -67,6 +82,7 @@ class MaskClassificationSemantic(LightningModule):
         self.mask_thresh = mask_thresh
         self.overlap_thresh = overlap_thresh
         self.stuff_classes = range(num_classes)
+        self.log_iou_per_class = log_iou_per_class
 
         self.criterion = MaskClassificationLoss(
             num_points=num_points,
@@ -110,7 +126,7 @@ class MaskClassificationSemantic(LightningModule):
                 )
 
     def on_validation_epoch_end(self):
-        self._on_eval_epoch_end_semantic("val")
+        self._on_eval_epoch_end_semantic("val", log_per_class=self.log_iou_per_class)
 
     def on_validation_end(self):
         self._on_eval_end_semantic("val")
